@@ -5,6 +5,8 @@ from pathlib import Path
 from rich.console import Console
 from rich.markdown import Markdown
 
+pd.set_option('future.no_silent_downcasting', True)
+
 #load
 def load_csv(path:str):
     try:
@@ -23,7 +25,7 @@ COLUMNS_TO_KEEP = [
     "Generation",
     "Release date",
     "Discontinued",
-    "Units Sold",
+    "Units sold",
     "Media_Type",
     "Launch price_GBP"
 ]
@@ -53,6 +55,7 @@ def split_lines(ml_list: str):
     return string_arr
     
 def get_eu_release(release_dates: str):
+    #ADD MORE DATE PATTERNS - year only, date month + year, month + year
        
     eu_release_date = re.search(r"[A-Z]*\/{,1}EU\/{,1}[A-Z]*: [a-zA-Z]+ [0-9]{,2}, [0-9]{4}", release_dates)
     release = eu_release_date if eu_release_date else re.search(r"WW: [a-zA-Z]+ [0-9]{,2}, [0-9]{4}", release_dates)
@@ -62,10 +65,10 @@ def get_eu_release(release_dates: str):
 def get_release_price(release_price: str):
     if release_price:
         if "equivalent" in release_price:
-            price_in_2020s = re.search(r"(equivalent to £[0-9]+ in [0-9]{4})", release_price) #.split()[2]
+            price_in_2020s = re.search(r"(equivalent to £[0-9,]+ in [0-9]{4})", release_price) #.split()[2]
             price = price_in_2020s.group().split()[2]
             
-            return float(price[1:]) #release price with inflation + without symbol
+            return float(re.sub(",", "", price[1:])) #release price with inflation + without symbol
         else:
             if release_price.startswith("£"):
                 return float(release_price[1:])
@@ -84,6 +87,19 @@ def get_media(media_type: str):
             
     return None
 
+def get_discontinued_date(discontinued_date: str):
+    dates = [
+        r"^EU: [a-zA-Z]+ [0-9]{,2},{,1} [0-9]{4}", #european
+        r"^WW: [a-zA-Z]+ [0-9]{,2},{,1} [0-9]{4}", #worlwide
+        r"^[a-zA-Z]+ [0-9]{,2},{,1} [0-9]{4}", #specified
+        r"^Q[0-9]{1} [0-9]{4}" #unspecified
+    ]
+
+    for date in dates:
+        match = re.match(date, discontinued_date)
+        if match:
+            return re.search(r"[0-9]{4}", match.group()).group()
+
 def remove_whitespace(table:pd.DataFrame):
     for column in table.columns:
         if table[column].dtype == "str":
@@ -94,67 +110,70 @@ def remove_whitespace(table:pd.DataFrame):
 def clean_columns(table:pd.DataFrame):
     #check if first row are indices ? drop : keep
     index_column_count: int = 0
+    total_column_count: int = 0
     generation = None
+    indexed = None
+
+    table = table.replace("", None)
 
     for column in table.columns:
-        #check for generations column
+        #check for generations column + pop
         if column == "Generation":
             generation = table.pop(column)[0]
+            total_column_count -=1
 
-        if column.isnumeric():
+        if column.isnumeric() or "Unnamed" in column:
             index_column_count+=1
 
-    #check if indices are numbered (more than half are unnamed)
-    if len(table.columns) - index_column_count < len(table.columns) / 2:
-        table.columns = table.iloc[0]
+        total_column_count +=1
 
-    #check if (new) second row contains first row ? (mark as multi-level) -> combine differing headings then drop
+    #🔵 remove index row
+    if total_column_count == index_column_count:
+        table.columns = table.iloc[0]
+        indexed = True
+
+    #🟣 remove index column
+    table = table.select_dtypes(exclude=['number'])
+
+    #🟢 normalise multi-level headings
     new_head = []
 
-    for i in range(len(table)):
-        #get first and second row for comparison
-        first_row = table.iloc[0].values
-        second_row = table.iloc[1].values
+    #extract first and second
+    first_row = table.iloc[0].values
+    second_row = table.iloc[1].values
 
-        #duplicate detector
-        similarity_count = 0
-        
-        for i, head in enumerate(first_row):
-            #print(first_row[i], ":", second_row[i]) <- debug
-
-            #string for nan to compare
-            if second_row[i] is np.nan:
-                second_row[i] = "?"
-
+    #first column (name/console) will be the same if multi-level
+    if first_row[0] in second_row[0]:
+        for i, head in enumerate(first_row):                
             #add heading to new headings if duplicate
-            if head in second_row[i]:
+            if str(head) in str(second_row[i]):
                 new_head.append(head)
-                similarity_count += 1
             else:
                 #add heading + subheading concat to new headings
                 new_head.append(f"{head}_{second_row[i]}")
-            
-        if similarity_count > len(table.columns)/2:
-            #columns over 50% similar - likely duplicate
-            new_head = []
-        else:
-            #drop parent column and sub column(by estimate)
-            table = table.drop(index=[0, 1])
-            break
 
-    #normalise columns
+        #drop sub row
+        table = table.drop([0, 1]).reset_index(drop=True)
+    
+    #🔴 leave single-level headings unchanged
+    elif indexed:
+        new_head = list(table.columns)
+        table = table.drop(0).reset_index(drop=True)
+    else:
+        new_head = list(table.columns)
+        
+
+    #normalise column titles
     for i, column in enumerate(new_head):
         match column:
             case "Release dates":
                 new_head[i] = "Release date"
-            case "Console":
+            case "Console" | "System":
                 new_head[i] = "Name"
             case "Launch prices_GBP":
                 new_head[i] = "Launch price_GBP"
             case "Media_Game media":
                 new_head[i] = "Media_Type"
-        
-        re.sub("_", " ", column)
 
     #rename columns
     table.columns = new_head
@@ -172,10 +191,10 @@ def clean_rows(table:pd.DataFrame):
     table = table.replace(np.nan, None)
 
     #remove citations
-    table = table.replace(r"\[[0-9]+\]", "", regex=True)
+    table = table.replace(r"\[[0-9a-zA-Z]+\]", "", regex=True)
 
     #strip whitespace
-    remove_whitespace(table)
+    #remove_whitespace(table)
 
     #extract useful vales
     if "Manufacturer" in table.columns:
@@ -193,6 +212,14 @@ def clean_rows(table:pd.DataFrame):
     if "Media_Type" in table.columns:
         table["Media_Type"] = table["Media_Type"].map(lambda x: get_media(x))
 
+    #discontinued
+    if "Discontinued" in table.columns:
+        table["Discontinued"] = table["Discontinued"].map(lambda x: get_discontinued_date(x))
+    
+    #remove extra text
+    table = table.replace(r"\([0-9a-zA-Z\s,.]+\)", "", regex=True).infer_objects(copy=False)
+
+    #remove nan values
     table = table.replace(np.nan, None)
 
     #convert column datatypes - types in notion
@@ -201,8 +228,12 @@ def clean_rows(table:pd.DataFrame):
 
 #testing
 def test():
+    test_val = 10
     for path in Path("..//data//raw//by_generation").iterdir():
+        #path = "..//data//raw//by_generation//Eighth_generation_of_video_game_consoles-2.csv"
+
         working_table = load_csv(path)
+        print(path.stem)
 
         #inspect
         cleaned_cols = clean_columns(working_table)
@@ -211,7 +242,11 @@ def test():
         console = Console()
         #console.print(Markdown(cleaned_cols.to_markdown()))
         console.print(Markdown(cleaned_rows.to_markdown()))
+        print("-" * 50)
 
-        break
+        test_val -= 1
 
-#test()
+        if test_val == 0:
+            break
+
+test()
